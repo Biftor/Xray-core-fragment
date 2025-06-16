@@ -3,6 +3,7 @@ package filesystem
 import (
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/GFW-knocker/Xray-core/common/buf"
 	"github.com/GFW-knocker/Xray-core/common/platform"
@@ -26,6 +27,13 @@ func ReadFile(path string) ([]byte, error) {
 
 func ReadAsset(file string) ([]byte, error) {
 	return ReadFile(platform.GetAssetLocation(file))
+}
+
+func ReadCert(file string) ([]byte, error) {
+	if filepath.IsAbs(file) {
+		return ReadFile(file)
+	}
+	return ReadFile(platform.GetCertLocation(file))
 }
 
 func CopyFile(dst string, src string) error {

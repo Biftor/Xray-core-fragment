@@ -46,9 +46,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 func (s *Server) policy() policy.Session {
 	config := s.config
 	p := s.policyManager.ForLevel(config.UserLevel)
-	if config.Timeout > 0 && config.UserLevel == 0 {
-		p.Timeouts.ConnectionIdle = time.Duration(config.Timeout) * time.Second
-	}
 	return p
 }
 
@@ -210,6 +207,7 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, reader *buf
 	}
 
 	responseDone := func() error {
+		inbound.CanSpliceCopy = 1
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
 
 		v2writer := buf.NewWriter(conn)
@@ -296,13 +294,13 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 
 	responseDone := func() error {
 		responseReader := bufio.NewReaderSize(&buf.BufferedReader{Reader: link.Reader}, buf.Size)
-		response, err := http.ReadResponse(responseReader, request)
+		response, err := readResponseAndHandle100Continue(responseReader, request, writer)
 		if err == nil {
 			http_proto.RemoveHopByHopHeaders(response.Header)
 			if response.ContentLength >= 0 {
 				response.Header.Set("Proxy-Connection", "keep-alive")
 				response.Header.Set("Connection", "keep-alive")
-				response.Header.Set("Keep-Alive", "timeout=4")
+				response.Header.Set("Keep-Alive", "timeout=60")
 				response.Close = false
 			} else {
 				response.Close = true
@@ -338,6 +336,38 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 	}
 
 	return result
+}
+
+// Sometimes, server might send 1xx response to client
+// it should not be processed by http proxy handler, just forward it to client
+func readResponseAndHandle100Continue(r *bufio.Reader, req *http.Request, writer io.Writer) (*http.Response, error) {
+	// have a little look of response
+	peekBytes, err := r.Peek(56)
+	if err == nil || err == bufio.ErrBufferFull {
+		str := string(peekBytes)
+		ResponseLine := strings.Split(str, "\r\n")[0]
+		_, status, _ := strings.Cut(ResponseLine, " ")
+		// only handle 1xx response
+		if strings.HasPrefix(status, "1") {
+			ResponseHeader1xx := []byte{}
+			// read until \r\n\r\n (end of http response header)
+			for {
+				data, err := r.ReadSlice('\n')
+				if err != nil {
+					return nil, errors.New("failed to read http 1xx response").Base(err)
+				}
+				ResponseHeader1xx = append(ResponseHeader1xx, data...)
+				if bytes.Equal(ResponseHeader1xx[len(ResponseHeader1xx)-4:], []byte{'\r', '\n', '\r', '\n'}) {
+					break
+				}
+				if len(ResponseHeader1xx) > 1024 {
+					return nil, errors.New("too big http 1xx response")
+				}
+			}
+			writer.Write(ResponseHeader1xx)
+		}
+	}
+	return http.ReadResponse(r, req)
 }
 
 func init() {

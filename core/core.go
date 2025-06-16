@@ -9,8 +9,6 @@
 // connections.
 package core
 
-//go:generate go run github.com/GFW-knocker/Xray-core/common/errors/errorgen
-
 import (
 	"fmt"
 	"runtime"
@@ -19,15 +17,15 @@ import (
 )
 
 var (
-	Version_x byte = 1
-	Version_y byte = 8
-	Version_z byte = 23
+	Version_x byte = 25
+	Version_y byte = 4
+	Version_z byte = 30
 )
 
 var (
 	build    = "Custom"
-	codename = "Xray, Penetrates Everything."
-	intro    = "A unified platform for anti-censorship."
+	codename = "MahsaNG Xray-core"
+	intro    = "in memory of Mahsa Amini."
 )
 
 // Version returns Xray's version as a string, in the form of "x.y.z" where x, y and z are numbers.

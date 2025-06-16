@@ -1,7 +1,5 @@
 package freedom
 
-//go:generate go run github.com/GFW-knocker/Xray-core/common/errors/errorgen
-
 import (
 	"bytes"
 	"context"
@@ -71,20 +69,17 @@ func (h *Handler) Init(config *Config, pm policy.Manager, d dns.Client) error {
 
 func (h *Handler) policy() policy.Session {
 	p := h.policyManager.ForLevel(h.config.UserLevel)
-	if h.config.Timeout > 0 && h.config.UserLevel == 0 {
-		p.Timeouts.ConnectionIdle = time.Duration(h.config.Timeout) * time.Second
-	}
 	return p
 }
 
 func (h *Handler) resolveIP(ctx context.Context, domain string, localAddr net.Address) net.Address {
-	ips, err := h.dns.LookupIP(domain, dns.IPOption{
+	ips, _, err := h.dns.LookupIP(domain, dns.IPOption{
 		IPv4Enable: (localAddr == nil || localAddr.Family().IsIPv4()) && h.config.preferIP4(),
 		IPv6Enable: (localAddr == nil || localAddr.Family().IsIPv6()) && h.config.preferIP6(),
 	})
 	{ // Resolve fallback
 		if (len(ips) == 0 || err != nil) && h.config.hasFallback() && localAddr == nil {
-			ips, err = h.dns.LookupIP(domain, dns.IPOption{
+			ips, _, err = h.dns.LookupIP(domain, dns.IPOption{
 				IPv4Enable: h.config.fallbackIP4(),
 				IPv6Enable: h.config.fallbackIP6(),
 			})
@@ -210,6 +205,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		} else {
 			writer = NewPacketWriter(conn, h, ctx, UDPOverride)
+			if h.config.Noises != nil {
+				errors.LogDebug(ctx, "NOISE", h.config.Noises)
+				writer = &NoisePacketWriter{
+					Writer:         writer,
+					noises:         h.config.Noises,
+					noiseKeepAlive: h.config.NoiseKeepAlive,
+					firstWrite:     true,
+					UDPOverride:    UDPOverride,
+				}
+			}
 		}
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
@@ -262,6 +267,9 @@ func isTLSConn(conn stat.Connection) bool {
 			conn = statConn.Connection
 		}
 		if _, ok := conn.(*tls.Conn); ok {
+			return true
+		}
+		if _, ok := conn.(*tls.UConn); ok {
 			return true
 		}
 	}
@@ -330,6 +338,7 @@ func NewPacketWriter(conn net.Conn, h *Handler, ctx context.Context, UDPOverride
 			Context:           ctx,
 			UDPOverride:       UDPOverride,
 		}
+
 	}
 	return &buf.SequentialWriter{Writer: conn}
 }
@@ -385,6 +394,108 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return nil
 }
 
+type NoisePacketWriter struct {
+	buf.Writer
+	noises         []*Noise
+	noiseKeepAlive uint32
+	firstWrite     bool
+	UDPOverride    net.Destination
+	stopChan       chan struct{} // Channel to stop the keepalive goroutine
+	ticker         *time.Ticker  // Ticker for periodic noise
+}
+
+// MultiBuffer writer with Noise before first packet
+func (w *NoisePacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if w.firstWrite {
+		w.firstWrite = false
+		//Do not send Noise for dns requests(just to be safe)
+		if w.UDPOverride.Port == 53 {
+			return w.Writer.WriteMultiBuffer(mb)
+		}
+
+		// Send initial noise
+		if err := w.sendNoise(); err != nil {
+			return err
+		}
+
+		// Start keepalive goroutine
+		if w.noiseKeepAlive > 0 {
+			w.stopChan = make(chan struct{})
+			w.ticker = time.NewTicker(time.Duration(w.noiseKeepAlive) * time.Second)
+			go w.keepNoiseAlive()
+		}
+
+	}
+	return w.Writer.WriteMultiBuffer(mb)
+}
+
+func (w *NoisePacketWriter) sendNoise() error {
+	var noise []byte
+	var err error
+	var count int64
+	var delay time.Duration
+
+	for _, n := range w.noises {
+		//User input string or base64 encoded string
+		if n.Packet != nil {
+			noise = n.Packet
+		} else {
+			//Random noise
+			noise, err = GenerateRandomBytes(randBetween(int64(n.LengthMin), int64(n.LengthMax)))
+		}
+		if err != nil {
+			return err
+		}
+
+		count = randBetween(int64(n.CountMin), int64(n.CountMax))
+		if count < 1 {
+			count = 1
+		} else if count > 100 {
+			count = 100
+		}
+
+		if n.DelayMin != 0 || n.DelayMax != 0 {
+			delay = time.Duration(randBetween(int64(n.DelayMin), int64(n.DelayMax))) * time.Millisecond
+		} else {
+			delay = time.Duration(0)
+		}
+
+		for range count {
+			w.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(noise)})
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+		}
+
+	}
+	return nil
+}
+
+func (w *NoisePacketWriter) keepNoiseAlive() {
+	for {
+		select {
+		case <-w.ticker.C:
+			if err := w.sendNoise(); err != nil {
+				break
+			}
+		case <-w.stopChan:
+			w.ticker.Stop()
+			return
+		}
+	}
+}
+
+// Close implements io.Closer
+func (w *NoisePacketWriter) Close() error {
+	if w.stopChan != nil {
+		close(w.stopChan)
+	}
+	if closer, ok := w.Writer.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 type FragmentWriter struct {
 	fragment *Fragment
 	writer   io.Writer
@@ -430,7 +541,7 @@ func (f *FragmentWriter) Write(b []byte) (int, error) {
 		data := b[5:recordLen]
 		buf := make([]byte, 1024)
 		queue := make([]byte, 2048)
-		n_queue := int(randBetween(int64(1), int64(4)))
+		n_queue := int(randBetween(int64(2), int64(4)))
 		L_queue := 0
 		c_queue := 0
 		for from := 0; ; {
@@ -513,11 +624,21 @@ func (f *FragmentWriter) Write(b []byte) (int, error) {
 	}
 }
 
-// copy from github.com/GFW-knocker/Xray-core/transport/internet/reality
 func randBetween(left int64, right int64) int64 {
 	if left == right {
 		return left
 	}
-	bigInt, _ := rand.Int(rand.Reader, big.NewInt(right-left))
+	bigInt, _ := rand.Int(rand.Reader, big.NewInt(right-left+1))
 	return left + bigInt.Int64()
+}
+
+func GenerateRandomBytes(n int64) ([]byte, error) {
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	// Note that err == nil only if we read len(b) bytes.
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
 }

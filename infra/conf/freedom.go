@@ -1,6 +1,8 @@
 package conf
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"net"
 	"strconv"
 	"strings"
@@ -14,10 +16,12 @@ import (
 
 type FreedomConfig struct {
 	DomainStrategy string    `json:"domainStrategy"`
-	Timeout        *uint32   `json:"timeout"`
 	Redirect       string    `json:"redirect"`
 	UserLevel      uint32    `json:"userLevel"`
 	Fragment       *Fragment `json:"fragment"`
+	Noise          *Noise    `json:"noise"`
+	Noises         []*Noise  `json:"noises"`
+	NoiseKeepAlive uint32    `json:"noiseKeepAlive"`
 	ProxyProtocol  uint32    `json:"proxyProtocol"`
 }
 
@@ -29,6 +33,13 @@ type Fragment struct {
 	Host1_domain string `json:"host1_domain"`
 	Host2_header string `json:"host2_header"`
 	Host2_domain string `json:"host2_domain"`
+}
+
+type Noise struct {
+	Type   string      `json:"type"`
+	Packet string      `json:"packet"`
+	Delay  *Int32Range `json:"delay"`
+	Count  *Int32Range `json:"count"`
 }
 
 // Build implements Buildable
@@ -182,9 +193,24 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 
 	}
 
-	if c.Timeout != nil {
-		config.Timeout = *c.Timeout
+	if c.Noise != nil {
+		return nil, errors.PrintRemovedFeatureError("noise = { ... }", "noises = [ { ... } ]")
 	}
+
+	if c.Noises != nil {
+		for _, n := range c.Noises {
+			NConfig, err := ParseNoise(n)
+			if err != nil {
+				return nil, err
+			}
+			config.Noises = append(config.Noises, NConfig)
+		}
+	}
+
+	// nosekeepalive keep repeating noise every n sec
+	// if not defined in json, default is zero which is disable
+	config.NoiseKeepAlive = c.NoiseKeepAlive
+
 	config.UserLevel = c.UserLevel
 	if len(c.Redirect) > 0 {
 		host, portStr, err := net.SplitHostPort(c.Redirect)
@@ -209,4 +235,56 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 		config.ProxyProtocol = c.ProxyProtocol
 	}
 	return config, nil
+}
+
+func ParseNoise(noise *Noise) (*freedom.Noise, error) {
+	var err error
+	NConfig := new(freedom.Noise)
+	noise.Packet = strings.TrimSpace(noise.Packet)
+
+	switch noise.Type {
+	case "rand":
+		min, max, err := ParseRangeString(noise.Packet)
+		if err != nil {
+			return nil, errors.New("invalid value for rand Length").Base(err)
+		}
+		NConfig.LengthMin = uint64(min)
+		NConfig.LengthMax = uint64(max)
+		if NConfig.LengthMin == 0 {
+			return nil, errors.New("rand lengthMin or lengthMax cannot be 0")
+		}
+
+	case "str":
+		// user input string
+		NConfig.Packet = []byte(noise.Packet)
+
+	case "hex":
+		// user input hex
+		NConfig.Packet, err = hex.DecodeString(noise.Packet)
+		if err != nil {
+			return nil, errors.New("Invalid hex string").Base(err)
+		}
+
+	case "base64":
+		// user input base64
+		NConfig.Packet, err = base64.RawURLEncoding.DecodeString(strings.NewReplacer("+", "-", "/", "_", "=", "").Replace(noise.Packet))
+		if err != nil {
+			return nil, errors.New("Invalid base64 string").Base(err)
+		}
+
+	default:
+		return nil, errors.New("Invalid packet, only rand/str/hex/base64 are supported")
+	}
+
+	if noise.Delay != nil {
+		NConfig.DelayMin = uint64(noise.Delay.From)
+		NConfig.DelayMax = uint64(noise.Delay.To)
+	}
+
+	if noise.Count != nil {
+		NConfig.CountMin = uint64(noise.Count.From)
+		NConfig.CountMax = uint64(noise.Count.To)
+	}
+
+	return NConfig, nil
 }

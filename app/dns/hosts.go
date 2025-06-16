@@ -2,12 +2,11 @@ package dns
 
 import (
 	"context"
+	"sort"
 
-	"github.com/GFW-knocker/Xray-core/common"
 	"github.com/GFW-knocker/Xray-core/common/errors"
 	"github.com/GFW-knocker/Xray-core/common/net"
 	"github.com/GFW-knocker/Xray-core/common/strmatcher"
-	"github.com/GFW-knocker/Xray-core/features"
 	"github.com/GFW-knocker/Xray-core/features/dns"
 )
 
@@ -18,28 +17,11 @@ type StaticHosts struct {
 }
 
 // NewStaticHosts creates a new StaticHosts instance.
-func NewStaticHosts(hosts []*Config_HostMapping, legacy map[string]*net.IPOrDomain) (*StaticHosts, error) {
+func NewStaticHosts(hosts []*Config_HostMapping) (*StaticHosts, error) {
 	g := new(strmatcher.MatcherGroup)
 	sh := &StaticHosts{
-		ips:      make([][]net.Address, len(hosts)+len(legacy)+16),
+		ips:      make([][]net.Address, len(hosts)+16),
 		matchers: g,
-	}
-
-	if legacy != nil {
-		features.PrintDeprecatedFeatureWarning("simple host mapping")
-
-		for domain, ip := range legacy {
-			matcher, err := strmatcher.Full.New(domain)
-			common.Must(err)
-			id := g.Add(matcher)
-
-			address := ip.AsAddress()
-			if address.Family().IsDomain() {
-				return nil, errors.New("invalid domain address in static hosts: ", address.Domain()).AtWarning()
-			}
-
-			sh.ips[id] = []net.Address{address}
-		}
 	}
 
 	for _, mapping := range hosts {
@@ -60,8 +42,6 @@ func NewStaticHosts(hosts []*Config_HostMapping, legacy map[string]*net.IPOrDoma
 				}
 				ips = append(ips, addr)
 			}
-		default:
-			return nil, errors.New("neither IP address nor proxied domain specified for domain: ", mapping.Domain).AtWarning()
 		}
 
 		sh.ips[id] = ips
@@ -81,17 +61,20 @@ func filterIP(ips []net.Address, option dns.IPOption) []net.Address {
 }
 
 func (h *StaticHosts) lookupInternal(domain string) []net.Address {
-	var ips []net.Address
-	for _, id := range h.matchers.Match(domain) {
-		ips = append(ips, h.ips[id]...)
+	MatchSlice := h.matchers.Match(domain)
+	sort.Slice(MatchSlice, func(i, j int) bool {
+		return MatchSlice[i] < MatchSlice[j]
+	})
+	if len(MatchSlice) == 0 {
+		return nil
 	}
-	return ips
+	return h.ips[MatchSlice[0]]
 }
 
 func (h *StaticHosts) lookup(domain string, option dns.IPOption, maxDepth int) []net.Address {
 	switch addrs := h.lookupInternal(domain); {
 	case len(addrs) == 0: // Not recorded in static hosts, return nil
-		return nil
+		return addrs
 	case len(addrs) == 1 && addrs[0].Family().IsDomain(): // Try to unwrap domain
 		errors.LogDebug(context.Background(), "found replaced domain: ", domain, " -> ", addrs[0].Domain(), ". Try to unwrap it")
 		if maxDepth > 0 {

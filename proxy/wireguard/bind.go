@@ -34,6 +34,8 @@ type netBind struct {
 
 	workers   int
 	readQueue chan *netReadInfo
+	isClosed  bool
+	mu        sync.Mutex
 }
 
 // SetMark implements conn.Bind
@@ -54,7 +56,7 @@ func (n *netBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 
 	addr := xnet.ParseAddress(ipStr)
 	if addr.Family() == xnet.AddressFamilyDomain {
-		ips, err := n.dns.LookupIP(addr.Domain(), n.dnsOption)
+		ips, _, err := n.dns.LookupIP(addr.Domain(), n.dnsOption)
 		if err != nil {
 			return nil, err
 		} else if len(ips) == 0 {
@@ -114,8 +116,12 @@ func (bind *netBind) Open(uport uint16) ([]conn.ReceiveFunc, uint16, error) {
 
 // Close implements conn.Bind
 func (bind *netBind) Close() error {
-	if bind.readQueue != nil {
+	bind.mu.Lock()
+	defer bind.mu.Unlock()
+
+	if bind.readQueue != nil && !bind.isClosed {
 		close(bind.readQueue)
+		bind.isClosed = true
 	}
 	return nil
 }

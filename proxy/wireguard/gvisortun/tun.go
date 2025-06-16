@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"sync"
 	"syscall"
 
 	"github.com/GFW-knocker/wireguard/tun"
@@ -33,6 +34,8 @@ type netTun struct {
 	incomingPacket chan *buffer.View
 	mtu            int
 	hasV4, hasV6   bool
+	closeOnce      sync.Once
+	closed         chan struct{} // (Knocker) Signal channel for shutdown
 }
 
 type Net netTun
@@ -51,6 +54,7 @@ func CreateNetTUN(localAddresses []netip.Addr, mtu int, promiscuousMode bool) (t
 		events:         make(chan tun.Event, 1),
 		incomingPacket: make(chan *buffer.View),
 		mtu:            mtu,
+		closed:         make(chan struct{}), // (Knocker) init channel for shutdown
 	}
 	dev.ep.AddNotify(dev)
 	tcpipErr := dev.stack.CreateNIC(1, dev.ep)
@@ -158,15 +162,30 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 
 // WriteNotify implements channel.Notification
 func (tun *netTun) WriteNotify() {
+
+	// (knocker) check if channel already closed
+	select {
+	case <-tun.closed:
+		return
+	default:
+	}
+
 	pkt := tun.ep.Read()
-	if pkt.IsNil() {
+	if pkt == nil {
 		return
 	}
 
 	view := pkt.ToView()
 	pkt.DecRef()
 
-	tun.incomingPacket <- view
+	select {
+	case tun.incomingPacket <- view:
+		return
+	case <-tun.closed:
+		view.Release() // avoid memory leak
+		return
+	}
+
 }
 
 // Flush  implements tun.Device
@@ -176,18 +195,16 @@ func (tun *netTun) Flush() error {
 
 // Close implements tun.Device
 func (tun *netTun) Close() error {
-	tun.stack.RemoveNIC(1)
+	tun.closeOnce.Do(func() {
 
-	if tun.events != nil {
+		// (knocker) Signal shutdown first
+		close(tun.closed)
+
+		tun.stack.RemoveNIC(1)
 		close(tun.events)
-	}
-
-	tun.ep.Close()
-
-	if tun.incomingPacket != nil {
+		tun.ep.Close()
 		close(tun.incomingPacket)
-	}
-
+	})
 	return nil
 }
 

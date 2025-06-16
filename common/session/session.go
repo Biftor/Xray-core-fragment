@@ -74,8 +74,8 @@ type Outbound struct {
 
 // SniffingRequest controls the behavior of content sniffing.
 type SniffingRequest struct {
-	ExcludeForDomain               []string
-	OverrideDestinationForProtocol []string
+	ExcludeForDomain               []string // read-only once set
+	OverrideDestinationForProtocol []string // read-only once set
 	Enabled                        bool
 	MetadataOnly                   bool
 	RouteOnly                      bool
