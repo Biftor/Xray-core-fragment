@@ -23,11 +23,18 @@ func main() {
 	}
 	fmt.Printf("ConfigFile: %s\n", configFilePath)
 
-	// Load, modify, and save the configuration file
-	err := processConfigFile(configFilePath, "fragment.json")
-	if err != nil {
-		fmt.Println("Error processing config file:", err)
-		return
+	// Check if fragment file exists before processing
+	fragmentFilePath := "fragment.json"
+	if _, err := os.Stat(fragmentFilePath); os.IsNotExist(err) {
+		fmt.Printf("Warning: Fragment file '%s' not found. Skipping config modification.\n", fragmentFilePath)
+		// Continue with original Xray execution without modifying config
+	} else {
+		// Load, modify, and save the configuration file
+		err := processConfigFile(configFilePath, fragmentFilePath)
+		if err != nil {
+			fmt.Println("Error processing config file:", err)
+			return
+		}
 	}
 
 	base.RootCommand.Long = "Xray is a platform for building proxies."
@@ -68,7 +75,7 @@ func getConfigFilePathToEdit() string {
 	return ""
 }
 
-// processConfigFile modifies the specified config file based on the logic for "vmess" and adds the fragment from fragment.json.
+// processConfigFile modifies the specified config file based on the logic for supported protocols and adds the fragment from fragment.json.
 func processConfigFile(configFilePath string, fragmentFilePath string) error {
 	// Read config file
 	configData, err := ioutil.ReadFile(configFilePath)
@@ -94,6 +101,16 @@ func processConfigFile(configFilePath string, fragmentFilePath string) error {
 		return fmt.Errorf("failed to parse fragment JSON: %w", err)
 	}
 
+	// Read sockopt file if it exists
+	var sockoptConfig map[string]interface{}
+	sockoptFilePath := "sockopt.json"
+	if sockoptData, err := ioutil.ReadFile(sockoptFilePath); err == nil {
+		if err := json.Unmarshal(sockoptData, &sockoptConfig); err != nil {
+			fmt.Printf("Warning: Failed to parse sockopt JSON: %v\n", err)
+			sockoptConfig = nil
+		}
+	}
+
 	// Check and modify the "outbounds" array
 	outbounds, ok := config["outbounds"].([]interface{})
 	if !ok {
@@ -101,7 +118,7 @@ func processConfigFile(configFilePath string, fragmentFilePath string) error {
 	}
 
 	// Modify existing outbounds and add the fragment
-	outbounds = modifyOutbounds(outbounds, fragment)
+	outbounds = modifyOutbounds(outbounds, fragment, sockoptConfig)
 	config["outbounds"] = outbounds
 
 	// Write back the updated config file
@@ -117,9 +134,10 @@ func processConfigFile(configFilePath string, fragmentFilePath string) error {
 	return nil
 }
 
-// modifyOutbounds updates "vmess" outbounds and appends the fragment if it doesn't exist.
-func modifyOutbounds(outbounds []interface{}, fragment map[string]interface{}) []interface{} {
+// modifyOutbounds updates supported protocol outbounds and appends the fragment if it doesn't exist.
+func modifyOutbounds(outbounds []interface{}, fragment map[string]interface{}, sockoptConfig map[string]interface{}) []interface{} {
 	fragmentExists := false
+	supportedProtocols := []string{"vmess", "vless", "trojan"}
 
 	for _, item := range outbounds {
 		outbound, ok := item.(map[string]interface{})
@@ -132,8 +150,8 @@ func modifyOutbounds(outbounds []interface{}, fragment map[string]interface{}) [
 			fragmentExists = true
 		}
 
-		// Update "vmess" outbound
-		if protocol, ok := outbound["protocol"].(string); ok && protocol == "vmess" {
+		// Update supported protocol outbounds (vmess, vless, trojan)
+		if protocol, ok := outbound["protocol"].(string); ok && contains(supportedProtocols, protocol) {
 			streamSettings, ok := outbound["streamSettings"].(map[string]interface{})
 			if !ok {
 				streamSettings = map[string]interface{}{}
@@ -144,9 +162,16 @@ func modifyOutbounds(outbounds []interface{}, fragment map[string]interface{}) [
 				sockopt = map[string]interface{}{}
 			}
 
-			// Add "dialerProxy": "fragment" if not already present
-			if _, exists := sockopt["dialerProxy"]; !exists {
-				sockopt["dialerProxy"] = "fragment"
+			// Merge sockopt.json content if available
+			if sockoptConfig != nil {
+				for key, value := range sockoptConfig {
+					sockopt[key] = value
+				}
+			} else {
+				// Fallback: Add "dialerProxy": "fragment" if not already present
+				if _, exists := sockopt["dialerProxy"]; !exists {
+					sockopt["dialerProxy"] = "fragment"
+				}
 			}
 
 			streamSettings["sockopt"] = sockopt
@@ -160,6 +185,16 @@ func modifyOutbounds(outbounds []interface{}, fragment map[string]interface{}) [
 	}
 
 	return outbounds
+}
+
+// contains checks if a slice contains a specific string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
 
 // getArgsV4Compatible ensures backward compatibility with command-line arguments.
