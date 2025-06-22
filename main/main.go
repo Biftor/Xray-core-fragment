@@ -1,15 +1,20 @@
 // Package main provides the entry point for Xray-core with enhanced configuration processing.
 // This version includes automatic configuration modification capabilities for proxy and fragment settings.
 //
-// Configuration Processing Order:
+// Configuration File Priority:
+// 1. Always uses config.json if it exists (regardless of command-line arguments)
+// 2. Uses specified config file only if config.json doesn't exist
+// 3. When using default config.json: no modifications are applied (used as-is)
+//
+// Configuration Processing Order (for non-default configs only):
 // 1. Proxy Configuration: Replaces existing "proxy" outbound with proxy.json content (if exists)
 // 2. Fragment Configuration: Adds fragment outbound and modifies supported protocols (if fragment.json exists)
 //
 // Supported Files:
-// - config.json: Main configuration file (required)
-// - proxy.json: Proxy outbound replacement configuration (optional)
-// - fragment.json: Fragment outbound configuration (optional)
-// - sockopt.json: Custom socket options for supported protocols (optional)
+// - config.json: Main configuration file (prioritized if exists, used as-is without modifications)
+// - proxy.json: Proxy outbound replacement configuration (optional, ignored when using default config.json)
+// - fragment.json: Fragment outbound configuration (optional, ignored when using default config.json)
+// - sockopt.json: Custom socket options for supported protocols (optional, ignored when using default config.json)
 //
 // Supported Protocols for Fragment Processing:
 // - vmess, vless, trojan
@@ -28,11 +33,13 @@ import (
 )
 
 // main is the entry point of the application.
-// It processes configuration files in the following order:
-// 1. Detects and validates the main configuration file
-// 2. Processes proxy.json for proxy outbound replacement
-// 3. Processes fragment.json for fragment configuration
-// 4. Executes the main Xray application
+// It processes configuration files with priority for default config.json:
+// 1. Detects and validates the main configuration file (prioritizes config.json if exists)
+// 2. Updates command-line arguments to ensure Xray uses the correct config file
+// 3. If using default config.json: skips all processing and uses it as-is
+// 4. If using custom config: processes proxy.json for proxy outbound replacement
+// 5. If using custom config: processes fragment.json for fragment configuration
+// 6. Executes the main Xray application
 func main() {
 	// Ensure backward compatibility with v4 command-line arguments
 	os.Args = getArgsV4Compatible()
@@ -45,23 +52,32 @@ func main() {
 	}
 	fmt.Printf("ConfigFile: %s\n", configFilePath)
 
-	// Step 2: Process proxy configuration (always runs, handles file existence internally)
-	// This will replace any existing outbound with tag "proxy" if proxy.json exists
-	err := processProxyConfig(configFilePath)
-	if err != nil {
-		fmt.Println("Error processing proxy config:", err)
-		return
+	// Step 2: Update os.Args to ensure Xray uses the correct config file
+	os.Args = updateArgsWithConfigFile(os.Args, configFilePath)
+
+	// Step 3: Check if we're using default config.json (skip processing if true)
+	usingDefaultConfig := isUsingDefaultConfig(configFilePath)
+	if usingDefaultConfig {
+		fmt.Println("Using default config.json - skipping proxy and fragment processing")
+	} else {
+		// Step 4: Process proxy configuration (only for non-default configs)
+		// This will replace any existing outbound with tag "proxy" if proxy.json exists
+		err := processProxyConfig(configFilePath)
+		if err != nil {
+			fmt.Println("Error processing proxy config:", err)
+			return
+		}
+
+		// Step 5: Process fragment configuration (only for non-default configs)
+		// This will add fragment outbound and modify supported protocols if fragment.json exists
+		err = processFragmentConfig(configFilePath)
+		if err != nil {
+			fmt.Println("Error processing fragment config:", err)
+			return
+		}
 	}
 
-	// Step 3: Process fragment configuration (always runs, handles file existence internally)
-	// This will add fragment outbound and modify supported protocols if fragment.json exists
-	err = processFragmentConfig(configFilePath)
-	if err != nil {
-		fmt.Println("Error processing fragment config:", err)
-		return
-	}
-
-	// Step 4: Initialize and execute the main Xray application
+	// Step 6: Initialize and execute the main Xray application
 	base.RootCommand.Long = "Xray is a platform for building proxies."
 	base.RootCommand.Commands = append(
 		[]*base.Command{
@@ -74,11 +90,15 @@ func main() {
 	base.Execute()
 }
 
-// getConfigFilePathToEdit extracts the configuration file path from command-line arguments.
-// It supports the following formats:
+// getConfigFilePathToEdit extracts the configuration file path with priority for default config.json.
+// Priority order:
+// 1. Always use "config.json" if it exists (regardless of command-line arguments)
+// 2. Use specified config file from command-line arguments if config.json doesn't exist
+// 3. Return empty string if no valid configuration file is found
+//
+// Supported command-line formats:
 // - "-c <path>" or "--config <path>": Configuration file path as separate argument
 // - "--config=<path>": Configuration file path with equals sign
-// - Default: "config.json" if no argument provided and file exists
 //
 // Returns:
 // - string: Path to the configuration file
@@ -87,7 +107,12 @@ func getConfigFilePathToEdit() string {
 	// Default configuration file name
 	defaultConfigFile := "config.json"
 
-	// Parse command-line arguments to find configuration file path
+	// Priority 1: Always use config.json if it exists
+	if _, err := os.Stat(defaultConfigFile); err == nil {
+		return defaultConfigFile
+	}
+
+	// Priority 2: Parse command-line arguments to find configuration file path
 	for i, arg := range os.Args {
 		// Handle "-c" or "--config" followed by path
 		if arg == "-c" || arg == "--config" {
@@ -101,13 +126,65 @@ func getConfigFilePathToEdit() string {
 		}
 	}
 
-	// Fall back to default config file if it exists
-	if _, err := os.Stat(defaultConfigFile); err == nil {
-		return defaultConfigFile
-	}
-
 	// No configuration file found
 	return ""
+}
+
+// updateArgsWithConfigFile updates the os.Args to ensure Xray uses the correct config file.
+// This function modifies the command-line arguments to replace any existing config file
+// specification with the determined config file path.
+//
+// Parameters:
+// - args: Original command-line arguments
+// - configFilePath: The config file path to use
+//
+// Returns:
+// - []string: Updated command-line arguments with correct config file
+func updateArgsWithConfigFile(args []string, configFilePath string) []string {
+	newArgs := []string{args[0]} // Keep the program name
+
+	// Skip any existing config arguments and add our determined config file
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+
+		// Skip -c, --config arguments and their values
+		if arg == "-c" || arg == "--config" {
+			// Skip this argument and the next one (the config file path)
+			if i+1 < len(args) {
+				i++ // Skip the config file path argument too
+			}
+			continue
+		} else if strings.HasPrefix(arg, "--config=") {
+			// Skip --config=<path> format
+			continue
+		} else {
+			// Keep other arguments
+			newArgs = append(newArgs, arg)
+		}
+	}
+
+	// Add our determined config file
+	newArgs = append(newArgs, "-c", configFilePath)
+
+	return newArgs
+}
+
+// isUsingDefaultConfig checks if we're using the default config.json file.
+// When using the default config.json, we should not modify it with proxy or fragment processing.
+//
+// Returns:
+// - bool: true if using default config.json, false otherwise
+func isUsingDefaultConfig(configFilePath string) bool {
+	defaultConfigFile := "config.json"
+
+	// Check if the config file path is the default config.json and it exists
+	if configFilePath == defaultConfigFile {
+		if _, err := os.Stat(defaultConfigFile); err == nil {
+			return true
+		}
+	}
+
+	return false
 }
 
 // processProxyConfig handles proxy.json replacement if it exists.
